@@ -5,11 +5,13 @@ import cn.wildfirechat.app.pojo.ConfirmSessionRequest;
 import cn.wildfirechat.app.pojo.CreateSessionRequest;
 import cn.wildfirechat.app.pojo.LoginResponse;
 import cn.wildfirechat.app.pojo.SessionOutput;
-import cn.wildfirechat.sdk.ChatAdmin;
+import cn.wildfirechat.common.ErrorCode;
+import cn.wildfirechat.pojos.*;
+import cn.wildfirechat.proto.ProtoConstants;
+import cn.wildfirechat.sdk.ChatConfig;
+import cn.wildfirechat.sdk.MessageAdmin;
+import cn.wildfirechat.sdk.UserAdmin;
 import cn.wildfirechat.sdk.model.IMResult;
-import cn.wildfirechat.sdk.model.Token;
-import cn.wildfirechat.sdk.model.User;
-import cn.wildfirechat.sdk.model.UserId;
 import com.github.qcloudsms.SmsSingleSender;
 import com.github.qcloudsms.SmsSingleSenderResult;
 import com.github.qcloudsms.httpclient.HTTPException;
@@ -17,6 +19,7 @@ import org.json.JSONException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.util.StringUtils;
 
 import javax.annotation.PostConstruct;
@@ -57,14 +60,17 @@ public class ServiceImpl implements Service {
     private static ConcurrentHashMap<String, Count> mCounts = new ConcurrentHashMap<>();
 
     @Autowired
-    private SMSConfig mSMSConfig;
+    private SmsService smsService;
 
     @Autowired
     private IMConfig mIMConfig;
 
+    @Value("${sms.super_code}")
+    private String superCode;
+
     @PostConstruct
     private void init() {
-        ChatAdmin.init(mIMConfig.admin_url, mIMConfig.admin_secret);
+        ChatConfig.initAdmin(mIMConfig.admin_url, mIMConfig.admin_secret);
     }
 
     @Override
@@ -92,25 +98,16 @@ public class ServiceImpl implements Service {
             }
 
             String code = Utils.getRandomCode(4);
-            String[] params = {code};
-            SmsSingleSender ssender = new SmsSingleSender(mSMSConfig.appid, mSMSConfig.appkey);
-            SmsSingleSenderResult result = ssender.sendWithParam("86", mobile,
-                    mSMSConfig.templateId, params, null, "", "");
-            if (result.result == 0) {
+
+            RestResult.RestCode restCode = smsService.sendCode(mobile, code);
+            if (restCode == RestResult.RestCode.SUCCESS) {
                 mRecords.put(mobile, new Record(code, mobile));
-                return RestResult.ok(null);
+                return RestResult.ok(restCode);
             } else {
-                LOG.error("Failure to send SMS {}", result);
-                return RestResult.error(RestResult.RestCode.ERROR_SERVER_ERROR);
+                return RestResult.error(restCode);
             }
-        } catch (HTTPException e) {
-            // HTTP响应码错误
-            e.printStackTrace();
         } catch (JSONException e) {
             // json解析错误
-            e.printStackTrace();
-        } catch (IOException e) {
-            // 网络IO错误
             e.printStackTrace();
         }
         return RestResult.error(RestResult.RestCode.ERROR_SERVER_ERROR);
@@ -118,7 +115,7 @@ public class ServiceImpl implements Service {
 
     @Override
     public RestResult login(String mobile, String code, String clientId) {
-        if (StringUtils.isEmpty(mSMSConfig.superCode) || !code.equals(mSMSConfig.superCode)) {
+        if (StringUtils.isEmpty(superCode) || !code.equals(superCode)) {
             Record record = mRecords.get(mobile);
             if (record == null || !record.getCode().equals(code)) {
                 LOG.error("not empty or not correct");
@@ -132,19 +129,19 @@ public class ServiceImpl implements Service {
 
         try {
             //使用电话号码查询用户信息。
-            IMResult<User> userResult = ChatAdmin.getUserByName(mobile);
+            IMResult<InputOutputUserInfo> userResult = UserAdmin.getUserByName(mobile);
 
             //如果用户信息不存在，创建用户
-            User user;
+            InputOutputUserInfo user;
             boolean isNewUser = false;
-            if (userResult.getCode() == IMResult.IMResultCode.IMRESULT_CODE_NOT_EXIST.code) {
+            if (userResult.getErrorCode() == ErrorCode.ERROR_CODE_NOT_EXIST) {
                 LOG.info("User not exist, try to create");
-                user = new User();
+                user = new InputOutputUserInfo();
                 user.setName(mobile);
                 user.setDisplayName(mobile);
                 user.setMobile(mobile);
-                IMResult<UserId> userIdResult = ChatAdmin.createUser(user);
-                if (userIdResult.getCode() == 0) {
+                IMResult<OutputCreateUser> userIdResult = UserAdmin.createUser(user);
+                if (userIdResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     user.setUserId(userIdResult.getResult().getUserId());
                     isNewUser = true;
                 } else {
@@ -159,8 +156,8 @@ public class ServiceImpl implements Service {
             }
 
             //使用用户id获取token
-            IMResult<Token> tokenResult = ChatAdmin.getUserToken(user.getUserId(), clientId);
-            if (tokenResult.getCode() != 0) {
+            IMResult<OutputGetIMTokenData> tokenResult = UserAdmin.getUserToken(user.getUserId(), clientId);
+            if (tokenResult.getErrorCode() != ErrorCode.ERROR_CODE_SUCCESS) {
                 LOG.error("Get user failure {}", tokenResult.code);
                 return RestResult.error(RestResult.RestCode.ERROR_SERVER_ERROR);
             }
@@ -170,12 +167,42 @@ public class ServiceImpl implements Service {
             response.setUserId(user.getUserId());
             response.setToken(tokenResult.getResult().getToken());
             response.setRegister(isNewUser);
+
+            if (isNewUser) {
+                sendTextMessage(user.getUserId(), mIMConfig.welcome_for_new_user);
+            } else {
+                sendTextMessage(user.getUserId(), mIMConfig.welcome_for_back_user);
+            }
+
             return RestResult.ok(response);
         } catch (Exception e) {
             e.printStackTrace();
             LOG.error("Exception happens {}", e);
             return RestResult.error(RestResult.RestCode.ERROR_SERVER_ERROR);
         }
+    }
+
+    private void sendTextMessage(String toUser, String text) {
+        Conversation conversation = new Conversation();
+        conversation.setTarget(toUser);
+        conversation.setType(ProtoConstants.ConversationType.ConversationType_Private);
+        MessagePayload payload = new MessagePayload();
+        payload.setType(1);
+        payload.setSearchableContent(text);
+
+
+        try {
+            IMResult<SendMessageResult> resultSendMessage = MessageAdmin.sendMessage("admin", conversation, payload);
+            if (resultSendMessage != null && resultSendMessage.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
+                LOG.info("send message success");
+            } else {
+                LOG.error("send message error {}", resultSendMessage != null ? resultSendMessage.getErrorCode().code : "unknown");
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            LOG.error("send message error {}", e.getLocalizedMessage());
+        }
+
     }
 
 
@@ -205,7 +232,7 @@ public class ServiceImpl implements Service {
             if (session.getStatus() == 2) {
                 //使用用户id获取token
                 try {
-                    IMResult<Token> tokenResult = ChatAdmin.getUserToken(session.getConfirmedUserId(), session.getClientId());
+                    IMResult<OutputGetIMTokenData> tokenResult = UserAdmin.getUserToken(session.getConfirmedUserId(), session.getClientId());
                     if (tokenResult.getCode() != 0) {
                         LOG.error("Get user failure {}", tokenResult.code);
                         return RestResult.error(RestResult.RestCode.ERROR_SERVER_ERROR);
